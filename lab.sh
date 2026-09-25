@@ -37,6 +37,17 @@ if command -v python3 >/dev/null 2>&1; then
 fi
 
 # ------------------------------------------------------------
+# Background download state. Only one download may run at a
+# time; its progress is tracked in these small files so the
+# main menu can show a status line without blocking anything.
+# ------------------------------------------------------------
+DL_LOCK="$HELPER_DIR/download.lock"
+DL_MODEL_FILE="$HELPER_DIR/download.model"
+DL_PERCENT_FILE="$HELPER_DIR/download.percent"
+DL_STATUS_FILE="$HELPER_DIR/download.status"
+DL_LOG_FILE="$HELPER_DIR/download.log"
+
+# ------------------------------------------------------------
 # Colours
 # ------------------------------------------------------------
 RED='\033[0;31m'
@@ -60,9 +71,16 @@ write_helper_scripts() {
     cat > "$PULL_PROGRESS_PY" <<'PYEOF'
 #!/usr/bin/env python3
 # Reads newline-delimited JSON progress events from stdin (Hailo-Ollama
-# /api/pull with stream=true) and renders a live progress bar per layer.
+# /api/pull with stream=true).
+#
+# In interactive mode it renders a live progress bar per layer. It can
+# also (always, if paths are given) mirror the current percentage and
+# overall status into small state files, so a caller running this in
+# the background can report progress elsewhere (e.g. a main menu)
+# without watching stdout at all.
 import sys
 import json
+import argparse
 
 GREEN = "\033[0;32m"
 YELLOW = "\033[1;33m"
@@ -99,10 +117,42 @@ def draw_bar(label, completed, total):
     sys.stdout.flush()
 
 
+def write_file(path, text):
+    if not path:
+        return
+    try:
+        with open(path, "w") as f:
+            f.write(text)
+    except OSError:
+        pass
+
+
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--percent-file", help="write the current 0-100 percent here")
+    parser.add_argument("--status-file", help="write downloading/verifying/success/failed here")
+    parser.add_argument("--plain", action="store_true",
+                         help="no ANSI progress bar - only plain status lines (for log files)")
+    args = parser.parse_args()
+
     last_key = None
     had_bar = False
-    saw_any = False
+    last_written_pct = None
+    finished = False  # once success/failed is recorded, don't downgrade it
+
+    def set_status(value):
+        nonlocal finished
+        if finished:
+            return
+        write_file(args.status_file, value)
+        if value in ("success", "failed"):
+            finished = True
+
+    def set_percent(pct):
+        nonlocal last_written_pct
+        if pct != last_written_pct:
+            write_file(args.percent_file, str(pct))
+            last_written_pct = pct
 
     for raw_line in sys.stdin:
         line = raw_line.strip()
@@ -113,41 +163,62 @@ def main():
         except ValueError:
             continue
 
-        saw_any = True
-
         if obj.get("error"):
-            if had_bar:
+            if had_bar and not args.plain:
                 print()
                 had_bar = False
-            print(f"  {RED}Error: {obj['error']}{RESET}")
+            msg = f"Error: {obj['error']}"
+            if args.plain:
+                print(f"  {msg}")
+            else:
+                print(f"  {RED}{msg}{RESET}")
+            set_status("failed")
             continue
 
-        status = obj.get("status") or ""
+        status = (obj.get("status") or "").strip()
         total = obj.get("total")
         completed = obj.get("completed")
         digest = obj.get("digest") or status
 
         if isinstance(total, (int, float)) and total > 0 and isinstance(completed, (int, float)):
-            if digest != last_key:
-                if had_bar:
-                    print()
-                last_key = digest
-            draw_bar(status or digest, completed, total)
-            had_bar = True
+            set_percent(int(min(100, completed / total * 100)))
+            set_status("downloading")
+            if not args.plain:
+                if digest != last_key:
+                    if had_bar:
+                        print()
+                    last_key = digest
+                draw_bar(status or digest, completed, total)
+                had_bar = True
         else:
-            if had_bar:
+            if had_bar and not args.plain:
                 print()
                 had_bar = False
             if status:
-                print(f"  {YELLOW}{status}{RESET}")
+                if args.plain:
+                    print(f"  {status}")
+                else:
+                    print(f"  {YELLOW}{status}{RESET}")
+                low = status.lower()
+                if "success" in low:
+                    set_percent(100)
+                    set_status("success")
+                elif "verify" in low:
+                    set_status("verifying")
+                elif "manifest" in low or "pulling" in low:
+                    set_status("downloading")
             last_key = None
 
-    if had_bar:
+    if had_bar and not args.plain:
         print()
-    if not saw_any:
-        # Nothing parsed as JSON progress - nothing else to do,
-        # caller already showed a generic "finished" message.
-        pass
+
+    # Stdin closed without an explicit success/error event (this is the
+    # "transfer closed with outstanding read data remaining" case: the
+    # server finishes and drops the connection before curl considers it
+    # cleanly closed). If we already saw every layer reach 100% and no
+    # error was reported, treat it as a success rather than a failure.
+    if not finished and last_written_pct == 100:
+        set_status("success")
 
 
 if __name__ == "__main__":
@@ -690,12 +761,143 @@ get_installed_models() {
 }
 
 # ------------------------------------------------------------
+# Background download management
+#
+# Only one download runs at a time. It's launched as a detached
+# background job that writes its progress/result into small state
+# files under HELPER_DIR, so the main menu (and everything else)
+# stays fully usable while it runs.
+# ------------------------------------------------------------
+
+# True (0) if a download is currently running; also opportunistically
+# cleans up a stale lock left behind by a job that died unexpectedly.
+is_download_active() {
+    if [ -f "$DL_LOCK" ]; then
+        local pid
+        pid="$(cat "$DL_LOCK" 2>/dev/null || true)"
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+        # Stale lock: the background job is gone but never cleaned up
+        # after itself (crash, killed process, reboot, ...).
+        rm -f "$DL_LOCK"
+        if [ -f "$DL_STATUS_FILE" ]; then
+            local st
+            st="$(cat "$DL_STATUS_FILE" 2>/dev/null || true)"
+            if [ "$st" != "success" ] && [ "$st" != "failed" ]; then
+                echo "failed" > "$DL_STATUS_FILE"
+            fi
+        fi
+    fi
+    return 1
+}
+
+# Kicks off the download for $1 in the background and returns
+# immediately - the caller is not blocked.
+start_download_background() {
+    local model="$1"
+    mkdir -p "$HELPER_DIR" 2>/dev/null
+
+    printf '%s' "$model" > "$DL_MODEL_FILE"
+    printf '%s' "0" > "$DL_PERCENT_FILE"
+    printf '%s' "downloading" > "$DL_STATUS_FILE"
+    : > "$DL_LOG_FILE"
+
+    (
+        trap '' HUP
+        REQUEST="{\"model\":\"$model\",\"stream\":true}"
+
+        if [ "$HAVE_PYTHON3" -eq 1 ] && [ -f "$PULL_PROGRESS_PY" ]; then
+            curl --no-buffer --silent --show-error \
+                "$BASE_URL/api/pull" \
+                -H 'Content-Type: application/json' \
+                -d "$REQUEST" \
+                2>> "$DL_LOG_FILE" \
+                | python3 "$PULL_PROGRESS_PY" --plain \
+                    --percent-file "$DL_PERCENT_FILE" \
+                    --status-file "$DL_STATUS_FILE" \
+                    >> "$DL_LOG_FILE" 2>&1
+            CURL_EXIT=${PIPESTATUS[0]}
+        else
+            curl --no-buffer --silent --show-error \
+                "$BASE_URL/api/pull" \
+                -H 'Content-Type: application/json' \
+                -d "$REQUEST" \
+                >> "$DL_LOG_FILE" 2>&1
+            CURL_EXIT=$?
+        fi
+
+        # Prefer the result the progress parser recorded (it knows
+        # whether a "success" event, or every layer reaching 100%,
+        # was actually seen). Some servers drop the connection right
+        # after finishing without closing it cleanly, which makes
+        # curl report a transfer error (exit 18) even though the
+        # download itself completed fine - don't let that override
+        # a real success.
+        FINAL_STATUS="$(cat "$DL_STATUS_FILE" 2>/dev/null || true)"
+        if [ "$FINAL_STATUS" != "success" ] && [ "$FINAL_STATUS" != "failed" ]; then
+            if [ "$CURL_EXIT" -eq 0 ]; then
+                echo "success" > "$DL_STATUS_FILE"
+            else
+                echo "failed" > "$DL_STATUS_FILE"
+                echo "curl exited with status $CURL_EXIT" >> "$DL_LOG_FILE"
+            fi
+        fi
+
+        rm -f "$DL_LOCK"
+    ) &
+    disown
+    echo $! > "$DL_LOCK"
+}
+
+# Prints a compact one-line download status for the main menu:
+# either live progress, or the outcome of the last completed download
+# (kept visible until the next download starts).
+show_download_status() {
+    if is_download_active; then
+        local dl_model dl_percent
+        dl_model="$(cat "$DL_MODEL_FILE" 2>/dev/null || echo "model")"
+        dl_percent="$(cat "$DL_PERCENT_FILE" 2>/dev/null || echo 0)"
+        echo
+        printf "  ${CYAN}\u2b07${RESET}  Downloading ${WHITE}%s${RESET}  ${YELLOW}%3s%%${RESET}\n" "$dl_model" "$dl_percent"
+    elif [ -f "$DL_STATUS_FILE" ]; then
+        local dl_model dl_status
+        dl_model="$(cat "$DL_MODEL_FILE" 2>/dev/null || echo "model")"
+        dl_status="$(cat "$DL_STATUS_FILE" 2>/dev/null || echo "")"
+        case "$dl_status" in
+            success)
+                echo
+                printf "  ${GREEN}\u2713${RESET}  Last download finished: ${WHITE}%s${RESET}\n" "$dl_model"
+                ;;
+            failed)
+                echo
+                printf "  ${RED}\u2717${RESET}  Last download failed: ${WHITE}%s${RESET}  ${CYAN}(log: %s)${RESET}\n" "$dl_model" "$DL_LOG_FILE"
+                ;;
+        esac
+    fi
+}
+
+# ------------------------------------------------------------
 # Download model
 # ------------------------------------------------------------
 download_model() {
     header
     echo -e "${WHITE}Download a Hailo model${RESET}"
     echo
+
+    if is_download_active; then
+        local dl_model dl_percent
+        dl_model="$(cat "$DL_MODEL_FILE" 2>/dev/null || echo "a model")"
+        dl_percent="$(cat "$DL_PERCENT_FILE" 2>/dev/null || echo 0)"
+        echo -e "${YELLOW}A download is already in progress:${RESET} $dl_model (${dl_percent}%)"
+        echo
+        echo "Only one download can run at a time. Its progress is shown"
+        echo "at the top of the main menu - wait for it to finish (or check"
+        echo "back here) before starting another."
+        pause
+        return
+    fi
+
     echo -e "${CYAN}Models available from Hailo:${RESET}"
     echo
 
@@ -713,35 +915,14 @@ download_model() {
     fi
     MODEL="$SELECTED_MODEL"
 
-    echo
-    echo -e "${YELLOW}Downloading:${RESET} $MODEL"
-    echo
-    echo "This may take some time."
-    echo
-
-    # stream=true allows us to display progress/messages returned
-    # by Hailo-Ollama.
-    if [ "$HAVE_PYTHON3" -eq 1 ] && [ -f "$PULL_PROGRESS_PY" ]; then
-        curl --no-buffer --silent --show-error \
-            "$BASE_URL/api/pull" \
-            -H 'Content-Type: application/json' \
-            -d "{\"model\":\"$MODEL\",\"stream\":true}" \
-            | python3 "$PULL_PROGRESS_PY"
-        DOWNLOAD_STATUS=${PIPESTATUS[0]}
-    else
-        curl --no-buffer --silent --show-error \
-            "$BASE_URL/api/pull" \
-            -H 'Content-Type: application/json' \
-            -d "{\"model\":\"$MODEL\",\"stream\":true}"
-        DOWNLOAD_STATUS=$?
-    fi
+    start_download_background "$MODEL"
 
     echo
-    if [ "$DOWNLOAD_STATUS" -eq 0 ]; then
-        echo -e "${GREEN}Download request finished.${RESET}"
-    else
-        echo -e "${RED}Download request failed.${RESET}"
-    fi
+    echo -e "${GREEN}Download started in the background:${RESET} $MODEL"
+    echo
+    echo "You're free to use the rest of the menu - chat with a model,"
+    echo "manage others, etc. Progress is shown at the top of the main"
+    echo "menu until it finishes."
     pause
 }
 
@@ -836,6 +1017,135 @@ loaded_models() {
     echo -e "${WHITE}Models currently loaded in Hailo-Ollama${RESET}"
     echo
     curl --silent --show-error "$BASE_URL/api/ps" | json_pretty
+    pause
+}
+
+# ------------------------------------------------------------
+# Load / unload a model from memory
+#
+# The Hailo NPU can only hold one model at a time, so loading a
+# new model always replaces whatever is currently loaded.
+# ------------------------------------------------------------
+
+# Populates LOADED_MODEL_NAME with the currently loaded model's name
+# (empty string if none is loaded). Returns 0 if a model is loaded,
+# 1 otherwise (including when the server isn't running).
+get_loaded_model() {
+    LOADED_MODEL_NAME=""
+    server_is_running || return 1
+
+    local resp
+    resp="$(curl --silent --max-time 3 "$BASE_URL/api/ps" 2>/dev/null)" || return 1
+    LOADED_MODEL_NAME="$(echo "$resp" | json_extract_names | head -n1)"
+    [ -n "$LOADED_MODEL_NAME" ]
+}
+
+# One-line "Loaded: ..." status for the main menu header. Silent if
+# the server isn't running (nothing meaningful to report).
+show_loaded_model_status() {
+    server_is_running || return 0
+    if get_loaded_model; then
+        echo -e "Loaded: ${WHITE}${LOADED_MODEL_NAME}${RESET}"
+    else
+        echo -e "Loaded: ${YELLOW}none${RESET}"
+    fi
+}
+
+load_model() {
+    header
+    echo -e "${WHITE}Load a model into memory${RESET}"
+    echo
+
+    if ! get_installed_models; then
+        pause
+        return 1
+    fi
+
+    print_numbered_names_with_size INSTALLED_MODELS INSTALLED_SIZES
+
+    if ! select_model_by_number INSTALLED_MODELS; then
+        echo -e "${YELLOW}Cancelled.${RESET}"
+        pause
+        return
+    fi
+    MODEL="$SELECTED_MODEL"
+
+    get_loaded_model
+    if [ -n "$LOADED_MODEL_NAME" ]; then
+        if [ "$LOADED_MODEL_NAME" = "$MODEL" ]; then
+            echo
+            echo -e "${GREEN}$MODEL is already loaded.${RESET}"
+            pause
+            return
+        fi
+
+        echo
+        if ! confirm_numbered "The Hailo NPU holds one model at a time. Unload '$LOADED_MODEL_NAME' and load '$MODEL' instead?"; then
+            echo "Cancelled."
+            pause
+            return
+        fi
+    fi
+
+    echo
+    echo -e "${YELLOW}Loading $MODEL into memory...${RESET}"
+
+    RESPONSE="$(
+        curl --silent --show-error \
+            "$BASE_URL/api/generate" \
+            -H 'Content-Type: application/json' \
+            -d "{\"model\":\"$MODEL\",\"keep_alive\":-1}" \
+            2>&1
+    )"
+    STATUS=$?
+
+    if [ "$STATUS" -eq 0 ]; then
+        echo -e "${GREEN}$MODEL is now loaded.${RESET}"
+    else
+        echo -e "${RED}Failed to load $MODEL.${RESET}"
+        echo "$RESPONSE"
+    fi
+    pause
+}
+
+unload_model() {
+    header
+    echo -e "${WHITE}Unload the current model from memory${RESET}"
+    echo
+
+    ensure_server || { pause; return 1; }
+
+    if ! get_loaded_model; then
+        echo -e "${YELLOW}No model is currently loaded.${RESET}"
+        pause
+        return
+    fi
+
+    echo -e "Currently loaded: ${WHITE}$LOADED_MODEL_NAME${RESET}"
+    echo
+
+    if ! confirm_numbered "Unload '$LOADED_MODEL_NAME' from memory?"; then
+        echo "Cancelled."
+        pause
+        return
+    fi
+
+    echo
+    RESPONSE="$(
+        curl --silent --show-error \
+            "$BASE_URL/api/generate" \
+            -H 'Content-Type: application/json' \
+            -d "{\"model\":\"$LOADED_MODEL_NAME\",\"keep_alive\":0}" \
+            2>&1
+    )"
+    STATUS=$?
+
+    if [ "$STATUS" -eq 0 ]; then
+        echo -e "${GREEN}$LOADED_MODEL_NAME unloaded.${RESET}"
+    else
+        echo -e "${RED}Failed to unload $LOADED_MODEL_NAME.${RESET}"
+        echo "$RESPONSE"
+    fi
     pause
 }
 
@@ -1084,6 +1394,8 @@ main_menu() {
 
         echo -e "Server: $SERVER_STATUS"
         echo -e "API:    ${BASE_URL}"
+        show_loaded_model_status
+        show_download_status
         echo
         echo "  1) Start server"
         echo "  2) Stop server"
@@ -1094,11 +1406,13 @@ main_menu() {
         echo "  6) List downloaded models"
         echo "  7) Remove downloaded model"
         echo "  8) Model information"
-        echo "  9) Show loaded models"
+        echo "  9) Load model into memory"
+        echo " 10) Unload model from memory"
+        echo " 11) Show loaded models"
         echo
-        echo " 10) List available Hailo models"
-        echo " 11) Hardware / software status"
-        echo " 12) Show server log"
+        echo " 12) List available Hailo models"
+        echo " 13) Hardware / software status"
+        echo " 14) Show server log"
         echo
         echo "  0) Exit"
         echo
@@ -1122,8 +1436,10 @@ main_menu() {
                 ;;
             7) remove_model ;;
             8) model_info ;;
-            9) loaded_models ;;
-            10)
+            9) load_model ;;
+            10) unload_model ;;
+            11) loaded_models ;;
+            12)
                 header
                 echo -e "${WHITE}Models available from Hailo${RESET}"
                 echo
@@ -1132,8 +1448,8 @@ main_menu() {
                 fi
                 pause
                 ;;
-            11) hardware_status ;;
-            12) show_log ;;
+            13) hardware_status ;;
+            14) show_log ;;
             0)
                 echo
                 echo "Goodbye."
