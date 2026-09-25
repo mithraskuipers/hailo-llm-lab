@@ -24,6 +24,19 @@ SERVER_PORT_FILE="$HOME/.hailo-ollama.port"
 CURL="curl --silent --show-error --fail"
 
 # ------------------------------------------------------------
+# Helper python scripts (progress bar for downloads, realtime
+# token streaming for chat). Written out once at startup into
+# HELPER_DIR if python3 is available.
+# ------------------------------------------------------------
+HELPER_DIR="$HOME/.hailo-ollama-helpers"
+PULL_PROGRESS_PY="$HELPER_DIR/pull_progress.py"
+CHAT_STREAM_PY="$HELPER_DIR/chat_stream.py"
+HAVE_PYTHON3=0
+if command -v python3 >/dev/null 2>&1; then
+    HAVE_PYTHON3=1
+fi
+
+# ------------------------------------------------------------
 # Colours
 # ------------------------------------------------------------
 RED='\033[0;31m'
@@ -33,6 +46,183 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 WHITE='\033[1;37m'
 RESET='\033[0m'
+
+# ------------------------------------------------------------
+# Write out the small python helpers used for:
+#   - a live progress bar while a model downloads
+#   - realtime (token-by-token) display of chat answers
+# Only needed/written when python3 is available.
+# ------------------------------------------------------------
+write_helper_scripts() {
+    [ "$HAVE_PYTHON3" -eq 1 ] || return 0
+    mkdir -p "$HELPER_DIR" 2>/dev/null || return 1
+
+    cat > "$PULL_PROGRESS_PY" <<'PYEOF'
+#!/usr/bin/env python3
+# Reads newline-delimited JSON progress events from stdin (Hailo-Ollama
+# /api/pull with stream=true) and renders a live progress bar per layer.
+import sys
+import json
+
+GREEN = "\033[0;32m"
+YELLOW = "\033[1;33m"
+RED = "\033[0;31m"
+CYAN = "\033[0;36m"
+RESET = "\033[0m"
+
+BAR_WIDTH = 30
+
+
+def fmt_bytes(n):
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "?"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024.0:
+            return f"{n:.1f}{unit}"
+        n /= 1024.0
+    return f"{n:.1f}PB"
+
+
+def draw_bar(label, completed, total):
+    total = max(total, 1)
+    completed = min(completed, total)
+    pct = completed / total * 100
+    filled = int(BAR_WIDTH * pct / 100)
+    bar = "#" * filled + "-" * (BAR_WIDTH - filled)
+    label = (label[:20] + "...") if len(label) > 23 else label
+    sys.stdout.write(
+        f"\r  {CYAN}{label:<23}{RESET} [{GREEN}{bar}{RESET}] "
+        f"{pct:5.1f}%  {fmt_bytes(completed):>9} / {fmt_bytes(total):<9}"
+    )
+    sys.stdout.flush()
+
+
+def main():
+    last_key = None
+    had_bar = False
+    saw_any = False
+
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+
+        saw_any = True
+
+        if obj.get("error"):
+            if had_bar:
+                print()
+                had_bar = False
+            print(f"  {RED}Error: {obj['error']}{RESET}")
+            continue
+
+        status = obj.get("status") or ""
+        total = obj.get("total")
+        completed = obj.get("completed")
+        digest = obj.get("digest") or status
+
+        if isinstance(total, (int, float)) and total > 0 and isinstance(completed, (int, float)):
+            if digest != last_key:
+                if had_bar:
+                    print()
+                last_key = digest
+            draw_bar(status or digest, completed, total)
+            had_bar = True
+        else:
+            if had_bar:
+                print()
+                had_bar = False
+            if status:
+                print(f"  {YELLOW}{status}{RESET}")
+            last_key = None
+
+    if had_bar:
+        print()
+    if not saw_any:
+        # Nothing parsed as JSON progress - nothing else to do,
+        # caller already showed a generic "finished" message.
+        pass
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, BrokenPipeError):
+        pass
+PYEOF
+
+    cat > "$CHAT_STREAM_PY" <<'PYEOF'
+#!/usr/bin/env python3
+# Reads newline-delimited JSON chat chunks from stdin (Hailo-Ollama
+# /api/chat with stream=true), prints each answer token as it arrives
+# so the user sees the answer being written in realtime, and writes
+# the fully assembled answer to the output file given as argv[1].
+import sys
+import json
+
+RED = "\033[0;31m"
+RESET = "\033[0m"
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("usage: chat_stream.py <output-file>", file=sys.stderr)
+        sys.exit(2)
+
+    out_path = sys.argv[1]
+    chunks = []
+
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+
+        if obj.get("error"):
+            sys.stdout.write(f"\n{RED}Error: {obj['error']}{RESET}\n")
+            sys.stdout.flush()
+            continue
+
+        content = ""
+        message = obj.get("message")
+        if isinstance(message, dict):
+            content = message.get("content") or ""
+        elif isinstance(obj.get("response"), str):
+            content = obj.get("response") or ""
+
+        if content:
+            sys.stdout.write(content)
+            sys.stdout.flush()
+            chunks.append(content)
+
+        if obj.get("done"):
+            break
+
+    try:
+        with open(out_path, "w") as f:
+            f.write("".join(chunks))
+    except OSError:
+        pass
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, BrokenPipeError):
+        pass
+PYEOF
+
+    return 0
+}
 
 # ------------------------------------------------------------
 # Utility functions
@@ -531,14 +721,27 @@ download_model() {
 
     # stream=true allows us to display progress/messages returned
     # by Hailo-Ollama.
-    curl --no-buffer --silent --show-error \
-        "$BASE_URL/api/pull" \
-        -H 'Content-Type: application/json' \
-        -d "{\"model\":\"$MODEL\",\"stream\":true}"
+    if [ "$HAVE_PYTHON3" -eq 1 ] && [ -f "$PULL_PROGRESS_PY" ]; then
+        curl --no-buffer --silent --show-error \
+            "$BASE_URL/api/pull" \
+            -H 'Content-Type: application/json' \
+            -d "{\"model\":\"$MODEL\",\"stream\":true}" \
+            | python3 "$PULL_PROGRESS_PY"
+        DOWNLOAD_STATUS=${PIPESTATUS[0]}
+    else
+        curl --no-buffer --silent --show-error \
+            "$BASE_URL/api/pull" \
+            -H 'Content-Type: application/json' \
+            -d "{\"model\":\"$MODEL\",\"stream\":true}"
+        DOWNLOAD_STATUS=$?
+    fi
 
     echo
-    echo
-    echo -e "${GREEN}Download request finished.${RESET}"
+    if [ "$DOWNLOAD_STATUS" -eq 0 ]; then
+        echo -e "${GREEN}Download request finished.${RESET}"
+    else
+        echo -e "${RED}Download request failed.${RESET}"
+    fi
     pause
 }
 
@@ -691,6 +894,14 @@ chat() {
                 ;;
         esac
 
+        # We can only show the answer being written in realtime when
+        # python3 is available to parse the streamed NDJSON chunks -
+        # otherwise fall back to a single blocking request.
+        CAN_STREAM=0
+        if [ "$HAVE_PYTHON3" -eq 1 ] && [ -f "$CHAT_STREAM_PY" ]; then
+            CAN_STREAM=1
+        fi
+
         if command -v jq >/dev/null 2>&1; then
             MESSAGES="$(
                 jq --arg content "$PROMPT" \
@@ -701,7 +912,8 @@ chat() {
                 jq -n \
                     --arg model "$MODEL" \
                     --argjson messages "$MESSAGES" \
-                    '{model: $model, messages: $messages, stream: false}'
+                    --argjson stream "$([ "$CAN_STREAM" -eq 1 ] && echo true || echo false)" \
+                    '{model: $model, messages: $messages, stream: $stream}'
             )"
         elif command -v python3 >/dev/null 2>&1; then
             MESSAGES="$(python3 -c '
@@ -712,8 +924,8 @@ print(json.dumps(msgs))
 ' "$MESSAGES" "$PROMPT")"
             REQUEST="$(python3 -c '
 import json, sys
-print(json.dumps({"model": sys.argv[1], "messages": json.loads(sys.argv[2]), "stream": False}))
-' "$MODEL" "$MESSAGES")"
+print(json.dumps({"model": sys.argv[1], "messages": json.loads(sys.argv[2]), "stream": sys.argv[3] == "1"}))
+' "$MODEL" "$MESSAGES" "$CAN_STREAM")"
         else
             echo -e "${RED}jq or python3 is required for interactive conversation history.${RESET}"
             echo "Install one with:"
@@ -727,32 +939,63 @@ print(json.dumps({"model": sys.argv[1], "messages": json.loads(sys.argv[2]), "st
         echo
         printf "${GREEN}Hailo>${RESET} "
 
-        RESPONSE="$(
-            curl --silent --show-error \
+        if [ "$CAN_STREAM" -eq 1 ]; then
+            # Stream the response so the answer appears as it's being
+            # generated, instead of waiting for the whole thing.
+            OUT_FILE="$(mktemp)"
+            ERR_FILE="$(mktemp)"
+
+            curl --no-buffer --silent --show-error \
                 --max-time 0 \
                 "$BASE_URL/api/chat" \
                 -H 'Content-Type: application/json' \
                 -d "$REQUEST" \
-                2>&1
-        )"
-        STATUS=$?
-
-        if [ "$STATUS" -ne 0 ]; then
+                2> "$ERR_FILE" \
+                | python3 "$CHAT_STREAM_PY" "$OUT_FILE"
+            STATUS=${PIPESTATUS[0]}
             echo
-            echo -e "${RED}Chat request failed.${RESET}"
-            echo "$RESPONSE"
-            continue
-        fi
 
-        if command -v jq >/dev/null 2>&1; then
-            if ! echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
+            if [ "$STATUS" -ne 0 ]; then
+                echo -e "${RED}Chat request failed.${RESET}"
+                cat "$ERR_FILE" 2>/dev/null
+                rm -f "$OUT_FILE" "$ERR_FILE"
+                continue
+            fi
+
+            ASSISTANT="$(cat "$OUT_FILE" 2>/dev/null)"
+            rm -f "$OUT_FILE" "$ERR_FILE"
+
+            if [ -z "$ASSISTANT" ]; then
+                echo -e "${YELLOW}(empty response)${RESET}"
+                continue
+            fi
+        else
+            RESPONSE="$(
+                curl --silent --show-error \
+                    --max-time 0 \
+                    "$BASE_URL/api/chat" \
+                    -H 'Content-Type: application/json' \
+                    -d "$REQUEST" \
+                    2>&1
+            )"
+            STATUS=$?
+
+            if [ "$STATUS" -ne 0 ]; then
                 echo
+                echo -e "${RED}Chat request failed.${RESET}"
                 echo "$RESPONSE"
                 continue
             fi
-            ASSISTANT="$(echo "$RESPONSE" | jq -r '.message.content // .response // empty')"
-        else
-            ASSISTANT="$(python3 -c '
+
+            if command -v jq >/dev/null 2>&1; then
+                if ! echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
+                    echo
+                    echo "$RESPONSE"
+                    continue
+                fi
+                ASSISTANT="$(echo "$RESPONSE" | jq -r '.message.content // .response // empty')"
+            else
+                ASSISTANT="$(python3 -c '
 import json, sys
 try:
     data = json.loads(sys.argv[1])
@@ -762,19 +1005,20 @@ msg = data.get("message", {})
 content = msg.get("content") if isinstance(msg, dict) else None
 print(content or data.get("response") or "")
 ' "$RESPONSE" 2>/dev/null)" || {
+                    echo
+                    echo "$RESPONSE"
+                    continue
+                }
+            fi
+
+            if [ -z "$ASSISTANT" ]; then
                 echo
-                echo "$RESPONSE"
+                echo "$RESPONSE" | json_pretty
                 continue
-            }
-        fi
+            fi
 
-        if [ -z "$ASSISTANT" ]; then
-            echo
-            echo "$RESPONSE" | json_pretty
-            continue
+            echo "$ASSISTANT"
         fi
-
-        echo "$ASSISTANT"
 
         # Add assistant answer to history.
         if command -v jq >/dev/null 2>&1; then
@@ -915,6 +1159,16 @@ fi
 if ! command -v hailo-ollama >/dev/null 2>&1; then
     echo "ERROR: hailo-ollama is not installed."
     exit 1
+fi
+
+if [ "$HAVE_PYTHON3" -eq 1 ]; then
+    if ! write_helper_scripts; then
+        echo -e "${YELLOW}Warning: could not write helper scripts to ${HELPER_DIR}; falling back to plain output.${RESET}"
+        HAVE_PYTHON3=0
+    fi
+else
+    echo -e "${YELLOW}Note: python3 not found - download progress bar and realtime chat streaming are disabled.${RESET}"
+    sleep 1
 fi
 
 main_menu
