@@ -850,30 +850,40 @@ start_download_background() {
     echo $! > "$DL_LOCK"
 }
 
-# Prints a compact one-line download status for the main menu:
-# either live progress, or the outcome of the last completed download
-# (kept visible until the next download starts).
-show_download_status() {
+
+# Computes just the download status line's text (no leading blank line,
+# no trailing newline) - empty string if there's nothing to show. Used
+# both by the normal menu draw and by the realtime refresh loop below.
+download_status_line_text() {
     if is_download_active; then
         local dl_model dl_percent
         dl_model="$(cat "$DL_MODEL_FILE" 2>/dev/null || echo "model")"
         dl_percent="$(cat "$DL_PERCENT_FILE" 2>/dev/null || echo 0)"
-        echo
-        printf "  ${CYAN}\u2b07${RESET}  Downloading ${WHITE}%s${RESET}  ${YELLOW}%3s%%${RESET}\n" "$dl_model" "$dl_percent"
+        printf "  ${CYAN}\u2b07${RESET}  Downloading ${WHITE}%s${RESET}  ${YELLOW}%3s%%${RESET}" "$dl_model" "$dl_percent"
     elif [ -f "$DL_STATUS_FILE" ]; then
         local dl_model dl_status
         dl_model="$(cat "$DL_MODEL_FILE" 2>/dev/null || echo "model")"
         dl_status="$(cat "$DL_STATUS_FILE" 2>/dev/null || echo "")"
         case "$dl_status" in
             success)
-                echo
-                printf "  ${GREEN}\u2713${RESET}  Last download finished: ${WHITE}%s${RESET}\n" "$dl_model"
+                printf "  ${GREEN}\u2713${RESET}  Last download finished: ${WHITE}%s${RESET}" "$dl_model"
                 ;;
             failed)
-                echo
-                printf "  ${RED}\u2717${RESET}  Last download failed: ${WHITE}%s${RESET}  ${CYAN}(log: %s)${RESET}\n" "$dl_model" "$DL_LOG_FILE"
+                printf "  ${RED}\u2717${RESET}  Last download failed: ${WHITE}%s${RESET}  ${CYAN}(log: %s)${RESET}" "$dl_model" "$DL_LOG_FILE"
                 ;;
         esac
+    fi
+}
+
+# Prints a compact one-line download status for the main menu:
+# either live progress, or the outcome of the last completed download
+# (kept visible until the next download starts).
+show_download_status() {
+    local text
+    text="$(download_status_line_text)"
+    if [ -n "$text" ]; then
+        echo
+        echo -e "$text"
     fi
 }
 
@@ -1379,12 +1389,53 @@ restart_server() {
 }
 
 # ------------------------------------------------------------
+# Reads the user's menu choice into $OPTION.
+#
+#   read_menu_option <up_offset> <poll>
+#
+# When poll=0, this is a plain blocking read (nothing to keep fresh).
+# When poll=1, it prints the prompt itself, then polls with a 1s
+# timeout so it can jump <up_offset> lines up, rewrite the download
+# status line in place, and jump back down - all without reprinting
+# the prompt or touching whatever the user may already be typing.
+# ------------------------------------------------------------
+read_menu_option() {
+    local up_offset="$1"
+    local poll="$2"
+    OPTION=""
+
+    if [ "$poll" -ne 1 ]; then
+        read -r -p "$PROMPT_TEXT" OPTION
+        return
+    fi
+
+    printf '%s' "$PROMPT_TEXT"
+    local last_text=""
+    while true; do
+        if read -r -t 1 OPTION; then
+            return
+        fi
+        local text
+        text="$(download_status_line_text)"
+        if [ "$text" != "$last_text" ]; then
+            printf '\033[s'
+            printf '\033[%dA' "$up_offset"
+            printf '\r\033[2K'
+            printf '%b' "$text"
+            printf '\033[u'
+            last_text="$text"
+        fi
+    done
+}
+
+# ------------------------------------------------------------
 # Main menu
 # ------------------------------------------------------------
 main_menu() {
+    PROMPT_TEXT="Select an option: "
+
     while true; do
         cleanup_dead_pid
-        header
 
         if server_is_running; then
             SERVER_STATUS="${GREEN}RUNNING${RESET}"
@@ -1392,32 +1443,66 @@ main_menu() {
             SERVER_STATUS="${RED}STOPPED${RESET}"
         fi
 
-        echo -e "Server: $SERVER_STATUS"
-        echo -e "API:    ${BASE_URL}"
-        show_loaded_model_status
-        show_download_status
-        echo
-        echo "  1) Start server"
-        echo "  2) Stop server"
-        echo "  3) Restart server"
-        echo
-        echo "  4) Chat with a model"
-        echo "  5) Download model"
-        echo "  6) List downloaded models"
-        echo "  7) Remove downloaded model"
-        echo "  8) Model information"
-        echo "  9) Load model into memory"
-        echo " 10) Unload model from memory"
-        echo " 11) Show loaded models"
-        echo
-        echo " 12) List available Hailo models"
-        echo " 13) Hardware / software status"
-        echo " 14) Show server log"
-        echo
-        echo "  0) Exit"
-        echo
+        # Build the screen as an array of lines rather than printing
+        # straight away, so we know exactly how many rows sit between
+        # the download-status line and the input prompt below. That
+        # lets us jump back up and refresh just that one line in place
+        # while waiting for input, without disturbing anything else
+        # (including whatever the user may already be typing).
+        MENU_LINES=()
+        MENU_LINES+=("Server: $SERVER_STATUS")
+        MENU_LINES+=("API:    ${BASE_URL}")
 
-        read -r -p "Select an option: " OPTION
+        LOADED_TXT="$(show_loaded_model_status)"
+        if [ -n "$LOADED_TXT" ]; then
+            while IFS= read -r ln; do MENU_LINES+=("$ln"); done <<< "$LOADED_TXT"
+        fi
+
+        DL_ACTIVE=0
+        if is_download_active; then
+            DL_ACTIVE=1
+        fi
+
+        DL_LINE_INDEX=-1
+        DL_TXT="$(show_download_status)"
+        if [ -n "$DL_TXT" ]; then
+            while IFS= read -r ln; do MENU_LINES+=("$ln"); done <<< "$DL_TXT"
+            if [ "$DL_ACTIVE" -eq 1 ]; then
+                DL_LINE_INDEX=$(( ${#MENU_LINES[@]} - 1 ))
+            fi
+        fi
+
+        MENU_LINES+=("")
+        MENU_LINES+=("  1) Start server")
+        MENU_LINES+=("  2) Stop server")
+        MENU_LINES+=("  3) Restart server")
+        MENU_LINES+=("")
+        MENU_LINES+=("  4) Chat with a model")
+        MENU_LINES+=("  5) Download model")
+        MENU_LINES+=("  6) List downloaded models")
+        MENU_LINES+=("  7) Remove downloaded model")
+        MENU_LINES+=("  8) Model information")
+        MENU_LINES+=("  9) Load model into memory")
+        MENU_LINES+=(" 10) Unload model from memory")
+        MENU_LINES+=(" 11) Show loaded models")
+        MENU_LINES+=("")
+        MENU_LINES+=(" 12) List available Hailo models")
+        MENU_LINES+=(" 13) Hardware / software status")
+        MENU_LINES+=(" 14) Show server log")
+        MENU_LINES+=("")
+        MENU_LINES+=("  0) Exit")
+        MENU_LINES+=("")
+
+        header
+        for ln in "${MENU_LINES[@]}"; do
+            echo -e "$ln"
+        done
+
+        if [ "$DL_LINE_INDEX" -ge 0 ] && [ "$HAVE_PYTHON3" -eq 1 ]; then
+            read_menu_option "$(( ${#MENU_LINES[@]} - DL_LINE_INDEX ))" 1
+        else
+            read_menu_option 0 0
+        fi
 
         case "$OPTION" in
             1) start_server; pause ;;
