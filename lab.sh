@@ -24,30 +24,6 @@ SERVER_PORT_FILE="$HOME/.hailo-ollama.port"
 CURL="curl --silent --show-error --fail"
 
 # ------------------------------------------------------------
-# Helper python scripts (progress bar for downloads, realtime
-# token streaming for chat). Written out once at startup into
-# HELPER_DIR if python3 is available.
-# ------------------------------------------------------------
-HELPER_DIR="$HOME/.hailo-ollama-helpers"
-PULL_PROGRESS_PY="$HELPER_DIR/pull_progress.py"
-CHAT_STREAM_PY="$HELPER_DIR/chat_stream.py"
-HAVE_PYTHON3=0
-if command -v python3 >/dev/null 2>&1; then
-    HAVE_PYTHON3=1
-fi
-
-# ------------------------------------------------------------
-# Background download state. Only one download may run at a
-# time; its progress is tracked in these small files so the
-# main menu can show a status line without blocking anything.
-# ------------------------------------------------------------
-DL_LOCK="$HELPER_DIR/download.lock"
-DL_MODEL_FILE="$HELPER_DIR/download.model"
-DL_PERCENT_FILE="$HELPER_DIR/download.percent"
-DL_STATUS_FILE="$HELPER_DIR/download.status"
-DL_LOG_FILE="$HELPER_DIR/download.log"
-
-# ------------------------------------------------------------
 # Colours
 # ------------------------------------------------------------
 RED='\033[0;31m'
@@ -57,243 +33,6 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 WHITE='\033[1;37m'
 RESET='\033[0m'
-
-# ------------------------------------------------------------
-# Write out the small python helpers used for:
-#   - a live progress bar while a model downloads
-#   - realtime (token-by-token) display of chat answers
-# Only needed/written when python3 is available.
-# ------------------------------------------------------------
-write_helper_scripts() {
-    [ "$HAVE_PYTHON3" -eq 1 ] || return 0
-    mkdir -p "$HELPER_DIR" 2>/dev/null || return 1
-
-    cat > "$PULL_PROGRESS_PY" <<'PYEOF'
-#!/usr/bin/env python3
-# Reads newline-delimited JSON progress events from stdin (Hailo-Ollama
-# /api/pull with stream=true).
-#
-# In interactive mode it renders a live progress bar per layer. It can
-# also (always, if paths are given) mirror the current percentage and
-# overall status into small state files, so a caller running this in
-# the background can report progress elsewhere (e.g. a main menu)
-# without watching stdout at all.
-import sys
-import json
-import argparse
-
-GREEN = "\033[0;32m"
-YELLOW = "\033[1;33m"
-RED = "\033[0;31m"
-CYAN = "\033[0;36m"
-RESET = "\033[0m"
-
-BAR_WIDTH = 30
-
-
-def fmt_bytes(n):
-    try:
-        n = float(n)
-    except (TypeError, ValueError):
-        return "?"
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024.0:
-            return f"{n:.1f}{unit}"
-        n /= 1024.0
-    return f"{n:.1f}PB"
-
-
-def draw_bar(label, completed, total):
-    total = max(total, 1)
-    completed = min(completed, total)
-    pct = completed / total * 100
-    filled = int(BAR_WIDTH * pct / 100)
-    bar = "#" * filled + "-" * (BAR_WIDTH - filled)
-    label = (label[:20] + "...") if len(label) > 23 else label
-    sys.stdout.write(
-        f"\r  {CYAN}{label:<23}{RESET} [{GREEN}{bar}{RESET}] "
-        f"{pct:5.1f}%  {fmt_bytes(completed):>9} / {fmt_bytes(total):<9}"
-    )
-    sys.stdout.flush()
-
-
-def write_file(path, text):
-    if not path:
-        return
-    try:
-        with open(path, "w") as f:
-            f.write(text)
-    except OSError:
-        pass
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--percent-file", help="write the current 0-100 percent here")
-    parser.add_argument("--status-file", help="write downloading/verifying/success/failed here")
-    parser.add_argument("--plain", action="store_true",
-                         help="no ANSI progress bar - only plain status lines (for log files)")
-    args = parser.parse_args()
-
-    last_key = None
-    had_bar = False
-    last_written_pct = None
-    finished = False  # once success/failed is recorded, don't downgrade it
-
-    def set_status(value):
-        nonlocal finished
-        if finished:
-            return
-        write_file(args.status_file, value)
-        if value in ("success", "failed"):
-            finished = True
-
-    def set_percent(pct):
-        nonlocal last_written_pct
-        if pct != last_written_pct:
-            write_file(args.percent_file, str(pct))
-            last_written_pct = pct
-
-    for raw_line in sys.stdin:
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except ValueError:
-            continue
-
-        if obj.get("error"):
-            if had_bar and not args.plain:
-                print()
-                had_bar = False
-            msg = f"Error: {obj['error']}"
-            if args.plain:
-                print(f"  {msg}")
-            else:
-                print(f"  {RED}{msg}{RESET}")
-            set_status("failed")
-            continue
-
-        status = (obj.get("status") or "").strip()
-        total = obj.get("total")
-        completed = obj.get("completed")
-        digest = obj.get("digest") or status
-
-        if isinstance(total, (int, float)) and total > 0 and isinstance(completed, (int, float)):
-            set_percent(int(min(100, completed / total * 100)))
-            set_status("downloading")
-            if not args.plain:
-                if digest != last_key:
-                    if had_bar:
-                        print()
-                    last_key = digest
-                draw_bar(status or digest, completed, total)
-                had_bar = True
-        else:
-            if had_bar and not args.plain:
-                print()
-                had_bar = False
-            if status:
-                if args.plain:
-                    print(f"  {status}")
-                else:
-                    print(f"  {YELLOW}{status}{RESET}")
-                low = status.lower()
-                if "success" in low:
-                    set_percent(100)
-                    set_status("success")
-                elif "verify" in low:
-                    set_status("verifying")
-                elif "manifest" in low or "pulling" in low:
-                    set_status("downloading")
-            last_key = None
-
-    if had_bar and not args.plain:
-        print()
-
-    # Stdin closed without an explicit success/error event (this is the
-    # "transfer closed with outstanding read data remaining" case: the
-    # server finishes and drops the connection before curl considers it
-    # cleanly closed). If we already saw every layer reach 100% and no
-    # error was reported, treat it as a success rather than a failure.
-    if not finished and last_written_pct == 100:
-        set_status("success")
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except (KeyboardInterrupt, BrokenPipeError):
-        pass
-PYEOF
-
-    cat > "$CHAT_STREAM_PY" <<'PYEOF'
-#!/usr/bin/env python3
-# Reads newline-delimited JSON chat chunks from stdin (Hailo-Ollama
-# /api/chat with stream=true), prints each answer token as it arrives
-# so the user sees the answer being written in realtime, and writes
-# the fully assembled answer to the output file given as argv[1].
-import sys
-import json
-
-RED = "\033[0;31m"
-RESET = "\033[0m"
-
-
-def main():
-    if len(sys.argv) < 2:
-        print("usage: chat_stream.py <output-file>", file=sys.stderr)
-        sys.exit(2)
-
-    out_path = sys.argv[1]
-    chunks = []
-
-    for raw_line in sys.stdin:
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except ValueError:
-            continue
-
-        if obj.get("error"):
-            sys.stdout.write(f"\n{RED}Error: {obj['error']}{RESET}\n")
-            sys.stdout.flush()
-            continue
-
-        content = ""
-        message = obj.get("message")
-        if isinstance(message, dict):
-            content = message.get("content") or ""
-        elif isinstance(obj.get("response"), str):
-            content = obj.get("response") or ""
-
-        if content:
-            sys.stdout.write(content)
-            sys.stdout.flush()
-            chunks.append(content)
-
-        if obj.get("done"):
-            break
-
-    try:
-        with open(out_path, "w") as f:
-            f.write("".join(chunks))
-    except OSError:
-        pass
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except (KeyboardInterrupt, BrokenPipeError):
-        pass
-PYEOF
-
-    return 0
-}
 
 # ------------------------------------------------------------
 # Utility functions
@@ -567,10 +306,13 @@ for m in data.get("models", []):
 }
 
 # Reads a Hailo-Ollama style {"models":[...]} JSON blob on stdin
-# and prints "name<TAB>size" per line (size in bytes, 0 if unknown).
+# and prints "name<US>size" per line (size in bytes, 0 if unknown).
+# Uses the ASCII Unit Separator (0x1F) rather than a tab: bash's
+# `read` quietly treats tab as "IFS whitespace" and strips leading/
+# empty fields, which corrupts rows where a field is blank.
 json_extract_name_size() {
     if command -v jq >/dev/null 2>&1; then
-        jq -r '.models[]? | [(.name // .model // "unknown"), (.size // 0)] | @tsv' 2>/dev/null
+        jq -r '.models[]? | [(.name // .model // "unknown"), ((.size // 0)|tostring)] | join("\u001f")' 2>/dev/null
     elif command -v python3 >/dev/null 2>&1; then
         python3 -c '
 import json, sys
@@ -580,14 +322,14 @@ except Exception:
     sys.exit(0)
 for m in data.get("models", []):
     if isinstance(m, str):
-        print(f"{m}\t0")
+        print(f"{m}\x1f0")
     elif isinstance(m, dict):
         name = m.get("name") or m.get("model") or "unknown"
         size = m.get("size") or 0
-        print(f"{name}\t{size}")
+        print(f"{name}\x1f{size}")
 ' 2>/dev/null
     else
-        grep -oE '"[A-Za-z0-9_.:/-]+"' | tr -d '"' | tail -n +2 | while read -r n; do printf "%s\t0\n" "$n"; done
+        grep -oE '"[A-Za-z0-9_.:/-]+"' | tr -d '"' | tail -n +2 | while read -r n; do printf "%s\x1f0\n" "$n"; done
     fi
 }
 
@@ -747,7 +489,7 @@ get_installed_models() {
 
     INSTALLED_MODELS=()
     INSTALLED_SIZES=()
-    while IFS=$'\t' read -r NAME SIZE; do
+    while IFS=$'\x1f' read -r NAME SIZE; do
         [ -z "$NAME" ] && continue
         INSTALLED_MODELS+=("$NAME")
         INSTALLED_SIZES+=("${SIZE:-0}")
@@ -761,130 +503,182 @@ get_installed_models() {
 }
 
 # ------------------------------------------------------------
-# Background download management
-#
-# Only one download runs at a time. It's launched as a detached
-# background job that writes its progress/result into small state
-# files under HELPER_DIR, so the main menu (and everything else)
-# stays fully usable while it runs.
+# Download progress bar
 # ------------------------------------------------------------
 
-# True (0) if a download is currently running; also opportunistically
-# cleans up a stale lock left behind by a job that died unexpectedly.
-is_download_active() {
-    if [ -f "$DL_LOCK" ]; then
-        local pid
-        pid="$(cat "$DL_LOCK" 2>/dev/null || true)"
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            return 0
-        fi
-        # Stale lock: the background job is gone but never cleaned up
-        # after itself (crash, killed process, reboot, ...).
-        rm -f "$DL_LOCK"
-        if [ -f "$DL_STATUS_FILE" ]; then
-            local st
-            st="$(cat "$DL_STATUS_FILE" 2>/dev/null || true)"
-            if [ "$st" != "success" ] && [ "$st" != "failed" ]; then
-                echo "failed" > "$DL_STATUS_FILE"
-            fi
-        fi
+# Formats a byte count as a human string like "123.4 MB".
+human_size() {
+    local bytes="${1:-0}"
+    awk -v b="$bytes" 'BEGIN {
+        if (b >= 1073741824) printf "%.2f GB", b/1073741824
+        else if (b >= 1048576) printf "%.1f MB", b/1048576
+        else if (b >= 1024) printf "%.1f KB", b/1024
+        else printf "%d B", b
+    }'
+}
+
+# Formats a second count as "Xm Ys" or "Ys".
+human_time() {
+    local secs="${1:-0}"
+    awk -v s="$secs" 'BEGIN {
+        if (s < 0) s = 0
+        m = int(s / 60); r = int(s % 60)
+        if (m > 0) printf "%dm %ds", m, r
+        else printf "%ds", r
+    }'
+}
+
+# Reads NDJSON progress objects on stdin (one per line, as sent by
+# /api/pull) and prints "status<US>completed<US>total<US>digest<US>error"
+# per line, using the ASCII Unit Separator (0x1F) as the delimiter.
+# A plain tab won't do here: bash's `read` treats tab as "IFS
+# whitespace" and silently drops a leading empty field (e.g. the
+# blank "status" on an {"error": "..."} line), shifting every field
+# after it. Runs as a single persistent process for the whole
+# stream, so it stays fast even with hundreds of progress updates.
+pull_progress_parser() {
+    if command -v jq >/dev/null 2>&1; then
+        jq -r --unbuffered '
+            [(.status // ""), ((.completed // 0)|tostring), ((.total // 0)|tostring), (.digest // ""), (.error // "")] | join("\u001f")
+        ' 2>/dev/null
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -u -c '
+import sys, json
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    try:
+        d = json.loads(raw)
+    except Exception:
+        continue
+    print("\x1f".join(str(x) for x in [
+        d.get("status") or "",
+        d.get("completed") or 0,
+        d.get("total") or 0,
+        d.get("digest") or "",
+        d.get("error") or "",
+    ]), flush=True)
+'
+    else
+        # No JSON parser available - pass raw lines through. The read
+        # loop below will just print them as plain status lines, so
+        # downloads still work, just without a progress bar.
+        cat
     fi
-    return 1
 }
 
-# Kicks off the download for $1 in the background and returns
-# immediately - the caller is not blocked.
-start_download_background() {
-    local model="$1"
-    mkdir -p "$HELPER_DIR" 2>/dev/null
+# Draws (or redraws, in place) one progress bar line.
+draw_progress_bar() {
+    local completed="$1" total="$2" digest="$3" speed_bps="$4" eta_secs="$5"
+    local width=30 label
+    label="${digest:0:12}"
+    [ -z "$label" ] && label="model"
 
-    printf '%s' "$model" > "$DL_MODEL_FILE"
-    printf '%s' "0" > "$DL_PERCENT_FILE"
-    printf '%s' "downloading" > "$DL_STATUS_FILE"
-    : > "$DL_LOG_FILE"
-
-    (
-        trap '' HUP
-        REQUEST="{\"model\":\"$model\",\"stream\":true}"
-
-        if [ "$HAVE_PYTHON3" -eq 1 ] && [ -f "$PULL_PROGRESS_PY" ]; then
-            curl --no-buffer --silent --show-error \
-                "$BASE_URL/api/pull" \
-                -H 'Content-Type: application/json' \
-                -d "$REQUEST" \
-                2>> "$DL_LOG_FILE" \
-                | python3 "$PULL_PROGRESS_PY" --plain \
-                    --percent-file "$DL_PERCENT_FILE" \
-                    --status-file "$DL_STATUS_FILE" \
-                    >> "$DL_LOG_FILE" 2>&1
-            CURL_EXIT=${PIPESTATUS[0]}
+    if [ "$total" -gt 0 ] 2>/dev/null; then
+        local pct filled empty bar size_str speed_str eta_str
+        pct=$(( completed * 100 / total ))
+        [ "$pct" -gt 100 ] && pct=100
+        filled=$(( width * pct / 100 ))
+        empty=$(( width - filled ))
+        bar="$(printf '%*s' "$filled" '' | tr ' ' '#')$(printf '%*s' "$empty" '' | tr ' ' '-')"
+        size_str="$(human_size "$completed")/$(human_size "$total")"
+        if [ "$speed_bps" -gt 0 ] 2>/dev/null; then
+            speed_str="$(human_size "$speed_bps")/s"
         else
-            curl --no-buffer --silent --show-error \
-                "$BASE_URL/api/pull" \
-                -H 'Content-Type: application/json' \
-                -d "$REQUEST" \
-                >> "$DL_LOG_FILE" 2>&1
-            CURL_EXIT=$?
+            speed_str="-- /s"
         fi
-
-        # Prefer the result the progress parser recorded (it knows
-        # whether a "success" event, or every layer reaching 100%,
-        # was actually seen). Some servers drop the connection right
-        # after finishing without closing it cleanly, which makes
-        # curl report a transfer error (exit 18) even though the
-        # download itself completed fine - don't let that override
-        # a real success.
-        FINAL_STATUS="$(cat "$DL_STATUS_FILE" 2>/dev/null || true)"
-        if [ "$FINAL_STATUS" != "success" ] && [ "$FINAL_STATUS" != "failed" ]; then
-            if [ "$CURL_EXIT" -eq 0 ]; then
-                echo "success" > "$DL_STATUS_FILE"
-            else
-                echo "failed" > "$DL_STATUS_FILE"
-                echo "curl exited with status $CURL_EXIT" >> "$DL_LOG_FILE"
-            fi
+        if [ "$eta_secs" -ge 0 ] 2>/dev/null; then
+            eta_str="ETA $(human_time "$eta_secs")"
+        else
+            eta_str="ETA --"
         fi
-
-        rm -f "$DL_LOCK"
-    ) &
-    disown
-    echo $! > "$DL_LOCK"
+        printf "\r\033[K${CYAN}Pulling %s${RESET} [${GREEN}%s${RESET}] %3d%%  %s  %s  %s" \
+            "$label" "$bar" "$pct" "$size_str" "$speed_str" "$eta_str"
+    else
+        printf "\r\033[K${CYAN}Pulling %s${RESET}  %s  (size unknown)" \
+            "$label" "$(human_size "$completed")"
+    fi
 }
 
+# Streams /api/pull for $1 and renders a live progress bar.
+# Returns 0 on a clean "success" completion, 1 otherwise.
+stream_pull_with_progress() {
+    local model="$1"
+    local current_digest="__none__" start_time="" start_completed=0
+    local had_error=0 lines_seen=0 last_status="" bar_open=0
+    local status completed total digest errmsg
 
-# Computes just the download status line's text (no leading blank line,
-# no trailing newline) - empty string if there's nothing to show. Used
-# both by the normal menu draw and by the realtime refresh loop below.
-download_status_line_text() {
-    if is_download_active; then
-        local dl_model dl_percent
-        dl_model="$(cat "$DL_MODEL_FILE" 2>/dev/null || echo "model")"
-        dl_percent="$(cat "$DL_PERCENT_FILE" 2>/dev/null || echo 0)"
-        printf "  ${CYAN}\u2b07${RESET}  Downloading ${WHITE}%s${RESET}  ${YELLOW}%3s%%${RESET}" "$dl_model" "$dl_percent"
-    elif [ -f "$DL_STATUS_FILE" ]; then
-        local dl_model dl_status
-        dl_model="$(cat "$DL_MODEL_FILE" 2>/dev/null || echo "model")"
-        dl_status="$(cat "$DL_STATUS_FILE" 2>/dev/null || echo "")"
-        case "$dl_status" in
-            success)
-                printf "  ${GREEN}\u2713${RESET}  Last download finished: ${WHITE}%s${RESET}" "$dl_model"
+    while IFS=$'\x1f' read -r status completed total digest errmsg; do
+        lines_seen=$((lines_seen + 1))
+        [ -z "$status" ] && [ -z "$errmsg" ] && continue
+
+        if [ -n "$errmsg" ]; then
+            if [ "$bar_open" -eq 1 ]; then
+                echo
+                bar_open=0
+            fi
+            echo -e "${RED}Error: $errmsg${RESET}"
+            had_error=1
+            continue
+        fi
+
+        last_status="$status"
+
+        case "$status" in
+            pulling*|downloading*)
+                if [ "$digest" != "$current_digest" ]; then
+                    [ "$bar_open" -eq 1 ] && echo
+                    current_digest="$digest"
+                    start_time="${EPOCHREALTIME:-$(date +%s.%N)}"
+                    start_completed="$completed"
+                fi
+
+                local now elapsed delta speed remaining eta
+                now="${EPOCHREALTIME:-$(date +%s.%N)}"
+                elapsed=$(awk -v a="$now" -v b="$start_time" 'BEGIN { d = a-b; if (d < 0.05) d = 0.05; print d }')
+                delta=$(( completed - start_completed ))
+                speed=$(awk -v d="$delta" -v e="$elapsed" 'BEGIN { v = d/e; if (v < 0) v = 0; printf "%.0f", v }')
+                if [ "$total" -gt 0 ] 2>/dev/null && [ "$speed" -gt 0 ] 2>/dev/null; then
+                    remaining=$(( total - completed ))
+                    eta=$(( remaining / speed ))
+                else
+                    eta=-1
+                fi
+
+                draw_progress_bar "$completed" "$total" "$digest" "$speed" "$eta"
+                bar_open=1
                 ;;
-            failed)
-                printf "  ${RED}\u2717${RESET}  Last download failed: ${WHITE}%s${RESET}  ${CYAN}(log: %s)${RESET}" "$dl_model" "$DL_LOG_FILE"
+            *)
+                if [ "$bar_open" -eq 1 ]; then
+                    echo
+                    bar_open=0
+                fi
+                echo -e "${CYAN}${status}${RESET}"
                 ;;
         esac
-    fi
-}
+    done < <(
+        curl --no-buffer --silent --show-error \
+            "$BASE_URL/api/pull" \
+            -H 'Content-Type: application/json' \
+            -d "{\"model\":\"$model\",\"stream\":true}" \
+        | pull_progress_parser
+    )
 
-# Prints a compact one-line download status for the main menu:
-# either live progress, or the outcome of the last completed download
-# (kept visible until the next download starts).
-show_download_status() {
-    local text
-    text="$(download_status_line_text)"
-    if [ -n "$text" ]; then
-        echo
-        echo -e "$text"
+    [ "$bar_open" -eq 1 ] && echo
+
+    if [ "$lines_seen" -eq 0 ]; then
+        echo -e "${RED}No response from the server - check the log (menu option 12).${RESET}"
+        return 1
     fi
+    if [ "$had_error" -eq 1 ]; then
+        return 1
+    fi
+    if [ "$last_status" != "success" ]; then
+        echo -e "${YELLOW}Stream ended without a 'success' confirmation (last status: ${last_status:-none}).${RESET}"
+        return 1
+    fi
+    return 0
 }
 
 # ------------------------------------------------------------
@@ -894,20 +688,6 @@ download_model() {
     header
     echo -e "${WHITE}Download a Hailo model${RESET}"
     echo
-
-    if is_download_active; then
-        local dl_model dl_percent
-        dl_model="$(cat "$DL_MODEL_FILE" 2>/dev/null || echo "a model")"
-        dl_percent="$(cat "$DL_PERCENT_FILE" 2>/dev/null || echo 0)"
-        echo -e "${YELLOW}A download is already in progress:${RESET} $dl_model (${dl_percent}%)"
-        echo
-        echo "Only one download can run at a time. Its progress is shown"
-        echo "at the top of the main menu - wait for it to finish (or check"
-        echo "back here) before starting another."
-        pause
-        return
-    fi
-
     echo -e "${CYAN}Models available from Hailo:${RESET}"
     echo
 
@@ -925,14 +705,17 @@ download_model() {
     fi
     MODEL="$SELECTED_MODEL"
 
-    start_download_background "$MODEL"
+    echo
+    echo -e "${YELLOW}Downloading:${RESET} $MODEL"
+    echo
 
-    echo
-    echo -e "${GREEN}Download started in the background:${RESET} $MODEL"
-    echo
-    echo "You're free to use the rest of the menu - chat with a model,"
-    echo "manage others, etc. Progress is shown at the top of the main"
-    echo "menu until it finishes."
+    if stream_pull_with_progress "$MODEL"; then
+        echo
+        echo -e "${GREEN}Download complete.${RESET}"
+    else
+        echo
+        echo -e "${RED}Download did not finish successfully.${RESET}"
+    fi
     pause
 }
 
@@ -1031,135 +814,6 @@ loaded_models() {
 }
 
 # ------------------------------------------------------------
-# Load / unload a model from memory
-#
-# The Hailo NPU can only hold one model at a time, so loading a
-# new model always replaces whatever is currently loaded.
-# ------------------------------------------------------------
-
-# Populates LOADED_MODEL_NAME with the currently loaded model's name
-# (empty string if none is loaded). Returns 0 if a model is loaded,
-# 1 otherwise (including when the server isn't running).
-get_loaded_model() {
-    LOADED_MODEL_NAME=""
-    server_is_running || return 1
-
-    local resp
-    resp="$(curl --silent --max-time 3 "$BASE_URL/api/ps" 2>/dev/null)" || return 1
-    LOADED_MODEL_NAME="$(echo "$resp" | json_extract_names | head -n1)"
-    [ -n "$LOADED_MODEL_NAME" ]
-}
-
-# One-line "Loaded: ..." status for the main menu header. Silent if
-# the server isn't running (nothing meaningful to report).
-show_loaded_model_status() {
-    server_is_running || return 0
-    if get_loaded_model; then
-        echo -e "Loaded: ${WHITE}${LOADED_MODEL_NAME}${RESET}"
-    else
-        echo -e "Loaded: ${YELLOW}none${RESET}"
-    fi
-}
-
-load_model() {
-    header
-    echo -e "${WHITE}Load a model into memory${RESET}"
-    echo
-
-    if ! get_installed_models; then
-        pause
-        return 1
-    fi
-
-    print_numbered_names_with_size INSTALLED_MODELS INSTALLED_SIZES
-
-    if ! select_model_by_number INSTALLED_MODELS; then
-        echo -e "${YELLOW}Cancelled.${RESET}"
-        pause
-        return
-    fi
-    MODEL="$SELECTED_MODEL"
-
-    get_loaded_model
-    if [ -n "$LOADED_MODEL_NAME" ]; then
-        if [ "$LOADED_MODEL_NAME" = "$MODEL" ]; then
-            echo
-            echo -e "${GREEN}$MODEL is already loaded.${RESET}"
-            pause
-            return
-        fi
-
-        echo
-        if ! confirm_numbered "The Hailo NPU holds one model at a time. Unload '$LOADED_MODEL_NAME' and load '$MODEL' instead?"; then
-            echo "Cancelled."
-            pause
-            return
-        fi
-    fi
-
-    echo
-    echo -e "${YELLOW}Loading $MODEL into memory...${RESET}"
-
-    RESPONSE="$(
-        curl --silent --show-error \
-            "$BASE_URL/api/generate" \
-            -H 'Content-Type: application/json' \
-            -d "{\"model\":\"$MODEL\",\"keep_alive\":-1}" \
-            2>&1
-    )"
-    STATUS=$?
-
-    if [ "$STATUS" -eq 0 ]; then
-        echo -e "${GREEN}$MODEL is now loaded.${RESET}"
-    else
-        echo -e "${RED}Failed to load $MODEL.${RESET}"
-        echo "$RESPONSE"
-    fi
-    pause
-}
-
-unload_model() {
-    header
-    echo -e "${WHITE}Unload the current model from memory${RESET}"
-    echo
-
-    ensure_server || { pause; return 1; }
-
-    if ! get_loaded_model; then
-        echo -e "${YELLOW}No model is currently loaded.${RESET}"
-        pause
-        return
-    fi
-
-    echo -e "Currently loaded: ${WHITE}$LOADED_MODEL_NAME${RESET}"
-    echo
-
-    if ! confirm_numbered "Unload '$LOADED_MODEL_NAME' from memory?"; then
-        echo "Cancelled."
-        pause
-        return
-    fi
-
-    echo
-    RESPONSE="$(
-        curl --silent --show-error \
-            "$BASE_URL/api/generate" \
-            -H 'Content-Type: application/json' \
-            -d "{\"model\":\"$LOADED_MODEL_NAME\",\"keep_alive\":0}" \
-            2>&1
-    )"
-    STATUS=$?
-
-    if [ "$STATUS" -eq 0 ]; then
-        echo -e "${GREEN}$LOADED_MODEL_NAME unloaded.${RESET}"
-    else
-        echo -e "${RED}Failed to unload $LOADED_MODEL_NAME.${RESET}"
-        echo "$RESPONSE"
-    fi
-    pause
-}
-
-# ------------------------------------------------------------
 # Interactive chat
 # ------------------------------------------------------------
 chat() {
@@ -1214,14 +868,6 @@ chat() {
                 ;;
         esac
 
-        # We can only show the answer being written in realtime when
-        # python3 is available to parse the streamed NDJSON chunks -
-        # otherwise fall back to a single blocking request.
-        CAN_STREAM=0
-        if [ "$HAVE_PYTHON3" -eq 1 ] && [ -f "$CHAT_STREAM_PY" ]; then
-            CAN_STREAM=1
-        fi
-
         if command -v jq >/dev/null 2>&1; then
             MESSAGES="$(
                 jq --arg content "$PROMPT" \
@@ -1232,8 +878,7 @@ chat() {
                 jq -n \
                     --arg model "$MODEL" \
                     --argjson messages "$MESSAGES" \
-                    --argjson stream "$([ "$CAN_STREAM" -eq 1 ] && echo true || echo false)" \
-                    '{model: $model, messages: $messages, stream: $stream}'
+                    '{model: $model, messages: $messages, stream: false}'
             )"
         elif command -v python3 >/dev/null 2>&1; then
             MESSAGES="$(python3 -c '
@@ -1244,8 +889,8 @@ print(json.dumps(msgs))
 ' "$MESSAGES" "$PROMPT")"
             REQUEST="$(python3 -c '
 import json, sys
-print(json.dumps({"model": sys.argv[1], "messages": json.loads(sys.argv[2]), "stream": sys.argv[3] == "1"}))
-' "$MODEL" "$MESSAGES" "$CAN_STREAM")"
+print(json.dumps({"model": sys.argv[1], "messages": json.loads(sys.argv[2]), "stream": False}))
+' "$MODEL" "$MESSAGES")"
         else
             echo -e "${RED}jq or python3 is required for interactive conversation history.${RESET}"
             echo "Install one with:"
@@ -1259,63 +904,32 @@ print(json.dumps({"model": sys.argv[1], "messages": json.loads(sys.argv[2]), "st
         echo
         printf "${GREEN}Hailo>${RESET} "
 
-        if [ "$CAN_STREAM" -eq 1 ]; then
-            # Stream the response so the answer appears as it's being
-            # generated, instead of waiting for the whole thing.
-            OUT_FILE="$(mktemp)"
-            ERR_FILE="$(mktemp)"
-
-            curl --no-buffer --silent --show-error \
+        RESPONSE="$(
+            curl --silent --show-error \
                 --max-time 0 \
                 "$BASE_URL/api/chat" \
                 -H 'Content-Type: application/json' \
                 -d "$REQUEST" \
-                2> "$ERR_FILE" \
-                | python3 "$CHAT_STREAM_PY" "$OUT_FILE"
-            STATUS=${PIPESTATUS[0]}
+                2>&1
+        )"
+        STATUS=$?
+
+        if [ "$STATUS" -ne 0 ]; then
             echo
+            echo -e "${RED}Chat request failed.${RESET}"
+            echo "$RESPONSE"
+            continue
+        fi
 
-            if [ "$STATUS" -ne 0 ]; then
-                echo -e "${RED}Chat request failed.${RESET}"
-                cat "$ERR_FILE" 2>/dev/null
-                rm -f "$OUT_FILE" "$ERR_FILE"
-                continue
-            fi
-
-            ASSISTANT="$(cat "$OUT_FILE" 2>/dev/null)"
-            rm -f "$OUT_FILE" "$ERR_FILE"
-
-            if [ -z "$ASSISTANT" ]; then
-                echo -e "${YELLOW}(empty response)${RESET}"
-                continue
-            fi
-        else
-            RESPONSE="$(
-                curl --silent --show-error \
-                    --max-time 0 \
-                    "$BASE_URL/api/chat" \
-                    -H 'Content-Type: application/json' \
-                    -d "$REQUEST" \
-                    2>&1
-            )"
-            STATUS=$?
-
-            if [ "$STATUS" -ne 0 ]; then
+        if command -v jq >/dev/null 2>&1; then
+            if ! echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
                 echo
-                echo -e "${RED}Chat request failed.${RESET}"
                 echo "$RESPONSE"
                 continue
             fi
-
-            if command -v jq >/dev/null 2>&1; then
-                if ! echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
-                    echo
-                    echo "$RESPONSE"
-                    continue
-                fi
-                ASSISTANT="$(echo "$RESPONSE" | jq -r '.message.content // .response // empty')"
-            else
-                ASSISTANT="$(python3 -c '
+            ASSISTANT="$(echo "$RESPONSE" | jq -r '.message.content // .response // empty')"
+        else
+            ASSISTANT="$(python3 -c '
 import json, sys
 try:
     data = json.loads(sys.argv[1])
@@ -1325,20 +939,19 @@ msg = data.get("message", {})
 content = msg.get("content") if isinstance(msg, dict) else None
 print(content or data.get("response") or "")
 ' "$RESPONSE" 2>/dev/null)" || {
-                    echo
-                    echo "$RESPONSE"
-                    continue
-                }
-            fi
-
-            if [ -z "$ASSISTANT" ]; then
                 echo
-                echo "$RESPONSE" | json_pretty
+                echo "$RESPONSE"
                 continue
-            fi
-
-            echo "$ASSISTANT"
+            }
         fi
+
+        if [ -z "$ASSISTANT" ]; then
+            echo
+            echo "$RESPONSE" | json_pretty
+            continue
+        fi
+
+        echo "$ASSISTANT"
 
         # Add assistant answer to history.
         if command -v jq >/dev/null 2>&1; then
@@ -1389,53 +1002,12 @@ restart_server() {
 }
 
 # ------------------------------------------------------------
-# Reads the user's menu choice into $OPTION.
-#
-#   read_menu_option <up_offset> <poll>
-#
-# When poll=0, this is a plain blocking read (nothing to keep fresh).
-# When poll=1, it prints the prompt itself, then polls with a 1s
-# timeout so it can jump <up_offset> lines up, rewrite the download
-# status line in place, and jump back down - all without reprinting
-# the prompt or touching whatever the user may already be typing.
-# ------------------------------------------------------------
-read_menu_option() {
-    local up_offset="$1"
-    local poll="$2"
-    OPTION=""
-
-    if [ "$poll" -ne 1 ]; then
-        read -r -p "$PROMPT_TEXT" OPTION
-        return
-    fi
-
-    printf '%s' "$PROMPT_TEXT"
-    local last_text=""
-    while true; do
-        if read -r -t 1 OPTION; then
-            return
-        fi
-        local text
-        text="$(download_status_line_text)"
-        if [ "$text" != "$last_text" ]; then
-            printf '\033[s'
-            printf '\033[%dA' "$up_offset"
-            printf '\r\033[2K'
-            printf '%b' "$text"
-            printf '\033[u'
-            last_text="$text"
-        fi
-    done
-}
-
-# ------------------------------------------------------------
 # Main menu
 # ------------------------------------------------------------
 main_menu() {
-    PROMPT_TEXT="Select an option: "
-
     while true; do
         cleanup_dead_pid
+        header
 
         if server_is_running; then
             SERVER_STATUS="${GREEN}RUNNING${RESET}"
@@ -1443,66 +1015,28 @@ main_menu() {
             SERVER_STATUS="${RED}STOPPED${RESET}"
         fi
 
-        # Build the screen as an array of lines rather than printing
-        # straight away, so we know exactly how many rows sit between
-        # the download-status line and the input prompt below. That
-        # lets us jump back up and refresh just that one line in place
-        # while waiting for input, without disturbing anything else
-        # (including whatever the user may already be typing).
-        MENU_LINES=()
-        MENU_LINES+=("Server: $SERVER_STATUS")
-        MENU_LINES+=("API:    ${BASE_URL}")
+        echo -e "Server: $SERVER_STATUS"
+        echo -e "API:    ${BASE_URL}"
+        echo
+        echo "  1) Start server"
+        echo "  2) Stop server"
+        echo "  3) Restart server"
+        echo
+        echo "  4) Chat with a model"
+        echo "  5) Download model"
+        echo "  6) List downloaded models"
+        echo "  7) Remove downloaded model"
+        echo "  8) Model information"
+        echo "  9) Show loaded models"
+        echo
+        echo " 10) List available Hailo models"
+        echo " 11) Hardware / software status"
+        echo " 12) Show server log"
+        echo
+        echo "  0) Exit"
+        echo
 
-        LOADED_TXT="$(show_loaded_model_status)"
-        if [ -n "$LOADED_TXT" ]; then
-            while IFS= read -r ln; do MENU_LINES+=("$ln"); done <<< "$LOADED_TXT"
-        fi
-
-        DL_ACTIVE=0
-        if is_download_active; then
-            DL_ACTIVE=1
-        fi
-
-        DL_LINE_INDEX=-1
-        DL_TXT="$(show_download_status)"
-        if [ -n "$DL_TXT" ]; then
-            while IFS= read -r ln; do MENU_LINES+=("$ln"); done <<< "$DL_TXT"
-            if [ "$DL_ACTIVE" -eq 1 ]; then
-                DL_LINE_INDEX=$(( ${#MENU_LINES[@]} - 1 ))
-            fi
-        fi
-
-        MENU_LINES+=("")
-        MENU_LINES+=("  1) Start server")
-        MENU_LINES+=("  2) Stop server")
-        MENU_LINES+=("  3) Restart server")
-        MENU_LINES+=("")
-        MENU_LINES+=("  4) Chat with a model")
-        MENU_LINES+=("  5) Download model")
-        MENU_LINES+=("  6) List downloaded models")
-        MENU_LINES+=("  7) Remove downloaded model")
-        MENU_LINES+=("  8) Model information")
-        MENU_LINES+=("  9) Load model into memory")
-        MENU_LINES+=(" 10) Unload model from memory")
-        MENU_LINES+=(" 11) Show loaded models")
-        MENU_LINES+=("")
-        MENU_LINES+=(" 12) List available Hailo models")
-        MENU_LINES+=(" 13) Hardware / software status")
-        MENU_LINES+=(" 14) Show server log")
-        MENU_LINES+=("")
-        MENU_LINES+=("  0) Exit")
-        MENU_LINES+=("")
-
-        header
-        for ln in "${MENU_LINES[@]}"; do
-            echo -e "$ln"
-        done
-
-        if [ "$DL_LINE_INDEX" -ge 0 ] && [ "$HAVE_PYTHON3" -eq 1 ]; then
-            read_menu_option "$(( ${#MENU_LINES[@]} - DL_LINE_INDEX ))" 1
-        else
-            read_menu_option 0 0
-        fi
+        read -r -p "Select an option: " OPTION
 
         case "$OPTION" in
             1) start_server; pause ;;
@@ -1521,10 +1055,8 @@ main_menu() {
                 ;;
             7) remove_model ;;
             8) model_info ;;
-            9) load_model ;;
-            10) unload_model ;;
-            11) loaded_models ;;
-            12)
+            9) loaded_models ;;
+            10)
                 header
                 echo -e "${WHITE}Models available from Hailo${RESET}"
                 echo
@@ -1533,8 +1065,8 @@ main_menu() {
                 fi
                 pause
                 ;;
-            13) hardware_status ;;
-            14) show_log ;;
+            11) hardware_status ;;
+            12) show_log ;;
             0)
                 echo
                 echo "Goodbye."
@@ -1560,16 +1092,6 @@ fi
 if ! command -v hailo-ollama >/dev/null 2>&1; then
     echo "ERROR: hailo-ollama is not installed."
     exit 1
-fi
-
-if [ "$HAVE_PYTHON3" -eq 1 ]; then
-    if ! write_helper_scripts; then
-        echo -e "${YELLOW}Warning: could not write helper scripts to ${HELPER_DIR}; falling back to plain output.${RESET}"
-        HAVE_PYTHON3=0
-    fi
-else
-    echo -e "${YELLOW}Note: python3 not found - download progress bar and realtime chat streaming are disabled.${RESET}"
-    sleep 1
 fi
 
 main_menu
