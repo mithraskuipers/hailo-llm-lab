@@ -12,6 +12,7 @@
 set -u
 
 SERVER_HOST="127.0.0.1"
+BIND_HOST="0.0.0.0"
 DEFAULT_SERVER_PORT="8000"
 PORT_SEARCH_RANGE=20   # how many ports to try (8000, 8001, 8002, ...)
 SERVER_PORT="$DEFAULT_SERVER_PORT"
@@ -176,7 +177,7 @@ start_server() {
     # Start independently from this shell so SSH disconnects
     # do not terminate the server. OLLAMA_HOST tells hailo-ollama
     # which interface/port to bind (see docs/USAGE.rst).
-    OLLAMA_HOST="${SERVER_HOST}:${SERVER_PORT}" \
+    OLLAMA_HOST="${BIND_HOST}:${SERVER_PORT}" \
         nohup hailo-ollama >"$SERVER_LOG" 2>&1 < /dev/null &
     PID=$!
     echo "$PID" > "$SERVER_PID"
