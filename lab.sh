@@ -21,6 +21,7 @@ SERVER_LOG="$HOME/.hailo-ollama.log"
 SERVER_PID="$HOME/.hailo-ollama.pid"
 SERVER_PORT_FILE="$HOME/.hailo-ollama.port"
 
+CHAT_STREAM_ENABLED=true
 CURL="curl --silent --show-error --fail"
 
 # ------------------------------------------------------------
@@ -813,12 +814,27 @@ loaded_models() {
     pause
 }
 
+toggle_chat_streaming() {
+    if [ "$CHAT_STREAM_ENABLED" = true ]; then
+        CHAT_STREAM_ENABLED=false
+        echo -e "${YELLOW}Chat response streaming is now OFF.${RESET}"
+    else
+        CHAT_STREAM_ENABLED=true
+        echo -e "${GREEN}Chat response streaming is now ON.${RESET}"
+    fi
+}
+
 # ------------------------------------------------------------
 # Interactive chat
 # ------------------------------------------------------------
 chat() {
     header
     echo -e "${WHITE}Hailo-Ollama Interactive Chat${RESET}"
+    if [ "$CHAT_STREAM_ENABLED" = true ]; then
+        echo -e "${CYAN}Response streaming: ON${RESET}"
+    else
+        echo -e "${CYAN}Response streaming: OFF${RESET}"
+    fi
     echo
 
     if ! get_installed_models; then
@@ -878,7 +894,8 @@ chat() {
                 jq -n \
                     --arg model "$MODEL" \
                     --argjson messages "$MESSAGES" \
-                    '{model: $model, messages: $messages, stream: false}'
+                    --argjson stream "$CHAT_STREAM_ENABLED" \
+                    '{model: $model, messages: $messages, stream: $stream}'
             )"
         elif command -v python3 >/dev/null 2>&1; then
             MESSAGES="$(python3 -c '
@@ -889,8 +906,8 @@ print(json.dumps(msgs))
 ' "$MESSAGES" "$PROMPT")"
             REQUEST="$(python3 -c '
 import json, sys
-print(json.dumps({"model": sys.argv[1], "messages": json.loads(sys.argv[2]), "stream": False}))
-' "$MODEL" "$MESSAGES")"
+print(json.dumps({"model": sys.argv[1], "messages": json.loads(sys.argv[2]), "stream": sys.argv[3].lower() == "true"}))
+' "$MODEL" "$MESSAGES" "$CHAT_STREAM_ENABLED")"
         else
             echo -e "${RED}jq or python3 is required for interactive conversation history.${RESET}"
             echo "Install one with:"
@@ -902,34 +919,109 @@ print(json.dumps({"model": sys.argv[1], "messages": json.loads(sys.argv[2]), "st
         fi
 
         echo
-        printf "${GREEN}Hailo>${RESET} "
 
-        RESPONSE="$(
-            curl --silent --show-error \
-                --max-time 0 \
-                "$BASE_URL/api/chat" \
-                -H 'Content-Type: application/json' \
-                -d "$REQUEST" \
-                2>&1
-        )"
-        STATUS=$?
+        if [ "$CHAT_STREAM_ENABLED" = true ]; then
+            printf "${GREEN}Hailo>${RESET} "
+            ASSISTANT=""
+            STREAM_STATUS=0
+            if command -v jq >/dev/null 2>&1; then
+                while IFS= read -r STREAM_LINE || [ -n "$STREAM_LINE" ]; do
+                    [ -z "$STREAM_LINE" ] && continue
 
-        if [ "$STATUS" -ne 0 ]; then
+                    if ! echo "$STREAM_LINE" | jq -e . >/dev/null 2>&1; then
+                        echo
+                        echo "$STREAM_LINE"
+                        continue
+                    fi
+
+                    CHUNK="$(echo "$STREAM_LINE" | jq -r '.message.content // .response // empty' 2>/dev/null || true)"
+                    if [ -n "$CHUNK" ]; then
+                        printf '%s' "$CHUNK"
+                        ASSISTANT="${ASSISTANT}${CHUNK}"
+                    fi
+
+                    if echo "$STREAM_LINE" | jq -e '.done == true' >/dev/null 2>&1; then
+                        break
+                    fi
+                done < <(curl --silent --show-error --no-buffer --max-time 0 \
+                    "$BASE_URL/api/chat" \
+                    -H 'Content-Type: application/json' \
+                    -d "$REQUEST" \
+                    2>&1) || STREAM_STATUS=$?
+            else
+                while IFS= read -r STREAM_LINE || [ -n "$STREAM_LINE" ]; do
+                    [ -z "$STREAM_LINE" ] && continue
+                    CHUNK="$(python3 -c '
+import json, sys
+try:
+    data = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(0)
+msg = data.get("message", {}) if isinstance(data.get("message"), dict) else {}
+content = msg.get("content") if isinstance(msg, dict) else None
+if content is None:
+    content = data.get("response") or ""
+print(content)
+' "$STREAM_LINE" 2>/dev/null || true)"
+                    if [ -n "$CHUNK" ]; then
+                        printf '%s' "$CHUNK"
+                        ASSISTANT="${ASSISTANT}${CHUNK}"
+                    fi
+                    if python3 -c '
+import json, sys
+try:
+    data = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(1)
+print(1 if data.get("done") is True else 0)
+' "$STREAM_LINE" >/dev/null 2>&1; then
+                        break
+                    fi
+                done < <(curl --silent --show-error --no-buffer --max-time 0 \
+                    "$BASE_URL/api/chat" \
+                    -H 'Content-Type: application/json' \
+                    -d "$REQUEST" \
+                    2>&1) || STREAM_STATUS=$?
+            fi
+
             echo
-            echo -e "${RED}Chat request failed.${RESET}"
-            echo "$RESPONSE"
-            continue
-        fi
+            if [ "$STREAM_STATUS" -ne 0 ]; then
+                echo -e "${RED}Chat request failed.${RESET}"
+                continue
+            fi
 
-        if command -v jq >/dev/null 2>&1; then
-            if ! echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
+            if [ -z "$ASSISTANT" ]; then
+                echo -e "${YELLOW}No response content was received.${RESET}"
+                continue
+            fi
+        else
+            printf "${GREEN}Hailo>${RESET} "
+            RESPONSE="$(
+                curl --silent --show-error \
+                    --max-time 0 \
+                    "$BASE_URL/api/chat" \
+                    -H 'Content-Type: application/json' \
+                    -d "$REQUEST" \
+                    2>&1
+            )"
+            STATUS=$?
+
+            if [ "$STATUS" -ne 0 ]; then
                 echo
+                echo -e "${RED}Chat request failed.${RESET}"
                 echo "$RESPONSE"
                 continue
             fi
-            ASSISTANT="$(echo "$RESPONSE" | jq -r '.message.content // .response // empty')"
-        else
-            ASSISTANT="$(python3 -c '
+
+            if command -v jq >/dev/null 2>&1; then
+                if ! echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
+                    echo
+                    echo "$RESPONSE"
+                    continue
+                fi
+                ASSISTANT="$(echo "$RESPONSE" | jq -r '.message.content // .response // empty')"
+            else
+                ASSISTANT="$(python3 -c '
 import json, sys
 try:
     data = json.loads(sys.argv[1])
@@ -939,19 +1031,20 @@ msg = data.get("message", {})
 content = msg.get("content") if isinstance(msg, dict) else None
 print(content or data.get("response") or "")
 ' "$RESPONSE" 2>/dev/null)" || {
+                    echo
+                    echo "$RESPONSE"
+                    continue
+                }
+            fi
+
+            if [ -z "$ASSISTANT" ]; then
                 echo
-                echo "$RESPONSE"
+                echo "$RESPONSE" | json_pretty
                 continue
-            }
-        fi
+            fi
 
-        if [ -z "$ASSISTANT" ]; then
-            echo
-            echo "$RESPONSE" | json_pretty
-            continue
+            echo "$ASSISTANT"
         fi
-
-        echo "$ASSISTANT"
 
         # Add assistant answer to history.
         if command -v jq >/dev/null 2>&1; then
@@ -1032,6 +1125,11 @@ main_menu() {
         echo " 10) List available Hailo models"
         echo " 11) Hardware / software status"
         echo " 12) Show server log"
+        if [ "$CHAT_STREAM_ENABLED" = true ]; then
+            echo " 13) Toggle chat response streaming (ON)"
+        else
+            echo " 13) Toggle chat response streaming (OFF)"
+        fi
         echo
         echo "  0) Exit"
         echo
@@ -1067,6 +1165,7 @@ main_menu() {
                 ;;
             11) hardware_status ;;
             12) show_log ;;
+            13) toggle_chat_streaming; pause ;;
             0)
                 echo
                 echo "Goodbye."
